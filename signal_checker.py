@@ -1,6 +1,7 @@
 
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -11,31 +12,43 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "EUR/USD"
 INTERVAL = "5min"
+FAST_PERIOD = 9
+SLOW_PERIOD = 21
 STATE_FILE = "last_signal.json"
 
 
-def get_json(url):
+def get_json(url, data=None):
     request = urllib.request.Request(
-        url, headers={"User-Agent": "ForexSignalBot/1.0"}
+        url,
+        data=data,
+        headers={"User-Agent": "ForexSignalBot/2.0"}
     )
-    with urllib.request.urlopen(request, timeout=25) as response:
-        return json.loads(response.read().decode("utf-8"))
+
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"HTTP request failed with status {error.code}"
+        ) from None
 
 
-def ema(values, period):
-    result = []
-    multiplier = 2 / (period + 1)
+def calculate_ema(values, period):
+    """Calculate EMA using an SMA seed."""
+    if len(values) < period:
+        raise ValueError("Not enough prices to calculate EMA")
+
+    result = [None] * len(values)
     current = sum(values[:period]) / period
+    result[period - 1] = current
+    multiplier = 2.0 / (period + 1)
 
-    for index, value in enumerate(values):
-        if index < period:
-            result.append(None)
-        elif index == period:
-            current = sum(values[index - period + 1:index + 1]) / period
-            result.append(current)
-        else:
-            current = value * multiplier + current * (1 - multiplier)
-            result.append(current)
+    for i in range(period, len(values)):
+        current = (
+            values[i] * multiplier
+            + current * (1.0 - multiplier)
+        )
+        result[i] = current
 
     return result
 
@@ -46,17 +59,21 @@ def send_telegram(message):
         + TELEGRAM_TOKEN
         + "/sendMessage"
     )
+
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message
-    }).encode()
+    }).encode("utf-8")
 
-    request = urllib.request.Request(url, data=payload)
-    with urllib.request.urlopen(request, timeout=25) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    result = get_json(url, data=payload)
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram did not accept the message")
+        description = result.get(
+            "description", "Unknown Telegram error"
+        )
+        raise RuntimeError(
+            "Telegram rejected the message: " + description
+        )
 
 
 def main():
@@ -73,70 +90,84 @@ def main():
 
     if "values" not in data:
         raise RuntimeError(
-            "Twelve Data error: " + str(data.get("message", data))
+            "Market data unavailable: "
+            + str(data.get("message", "No candle data returned"))
         )
 
-    # API usually returns newest candle first.
+    # Twelve Data normally returns newest candles first.
     candles = list(reversed(data["values"]))
 
-    # Exclude the newest candle because it may still be forming.
-    candles = candles[:-1]
+    # Exclude the newest candle in case it is still forming.
+    if len(candles) > 0:
+        candles = candles[:-1]
 
-    if len(candles) < 30:
-        raise RuntimeError("Not enough completed candles")
+    if len(candles) < SLOW_PERIOD + 2:
+        raise RuntimeError(
+            "Not enough completed candles for EMA analysis"
+        )
 
-    closes = [float(c["close"]) for c in candles]
-    fast = ema(closes, 9)
-    slow = ema(closes, 21)
+    closes = [float(candle["close"]) for candle in candles]
+    fast = calculate_ema(closes, FAST_PERIOD)
+    slow = calculate_ema(closes, SLOW_PERIOD)
 
-    # Compare the two most recent completed candles.
-    i = len(candles) - 1
-    previous = i - 1
+    current_index = len(candles) - 1
+    previous_index = current_index - 1
 
-    if fast[previous] is None or slow[previous] is None:
-        raise RuntimeError("Not enough EMA data")
+    previous_fast = fast[previous_index]
+    previous_slow = slow[previous_index]
+    current_fast = fast[current_index]
+    current_slow = slow[current_index]
 
-    candle_time = candles[i]["datetime"]
+    candle_time = candles[current_index]["datetime"]
 
     state = {}
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            state = json.load(file)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            state = {}
 
     if state.get("last_checked_candle") == candle_time:
-        print("Already checked this candle.")
+        print("This completed candle was already checked.")
         return
 
     signal = None
 
-    if fast[previous] <= slow[previous] and fast[i] > slow[i]:
+    if previous_fast <= previous_slow and current_fast > current_slow:
         signal = "BUY"
-    elif fast[previous] >= slow[previous] and fast[i] < slow[i]:
+    elif previous_fast >= previous_slow and current_fast < current_slow:
         signal = "SELL"
 
+    # Record the candle so the same candle is not alerted repeatedly.
     state["last_checked_candle"] = candle_time
+    state["last_signal"] = signal
 
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
 
     if signal:
-        price = closes[i]
         message = (
-            f"Forex signal: {signal}\n"
-            f"Pair: {SYMBOL}\n"
-            f"Timeframe: {INTERVAL}\n"
+            f"EUR/USD {signal} SIGNAL\n"
+            f"Timeframe: M5\n"
             f"Completed candle: {candle_time}\n"
-            f"Close: {price:.5f}\n"
+            f"Close price: {closes[current_index]:.5f}\n"
+            f"Fast EMA ({FAST_PERIOD}): {current_fast:.5f}\n"
+            f"Slow EMA ({SLOW_PERIOD}): {current_slow:.5f}\n"
             f"Strategy: EMA 9/21 crossover\n"
             f"Mode: SIGNAL ONLY — no trade placed\n"
             f"Generated: {datetime.now(timezone.utc).isoformat()}"
         )
+
         send_telegram(message)
+        print("Telegram signal sent successfully.")
         print(message)
     else:
-        print(f"No new crossover for {SYMBOL} at {candle_time}")
+        print(
+            f"No new crossover for {SYMBOL} "
+            f"at {candle_time}"
+        )
 
 
 if __name__ == "__main__":
     main()
-  
