@@ -1,4 +1,14 @@
 {
   "last_checked_candle": "2026-10-15 10:01:00",
-  "last_signal": null
+  "last_signal": null,
+  "markets": {
+    "EUR/USD": {
+      "last_checked_candle": "2026-10-14 23:07:00",
+      "last_signal": null
+    },
+    "XAU/USD": {
+      "last_checked_candle": "2026-10-14 23:07:00",
+      "last_signal": null
+    }
+  }
 }
