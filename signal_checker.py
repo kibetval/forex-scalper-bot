@@ -6,18 +6,21 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-# Existing GitHub Actions secrets — keep their names unchanged.
+# Keep your existing GitHub Secrets unchanged.
 API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SYMBOL = "EUR/USD"
+MARKETS = {
+    "EUR/USD": {"label": "EUR/USD", "precision": 5},
+    "XAU/USD": {"label": "XAU/USD (GOLD)", "precision": 2},
+}
+
 INTERVAL = "1min"
 FAST_PERIOD = 9
 SLOW_PERIOD = 21
 ATR_PERIOD = 14
 
-# Balanced scalping risk estimates.
 SL_ATR_MULTIPLIER = 1.2
 TP_ATR_MULTIPLIER = 1.8
 
@@ -28,7 +31,7 @@ def get_json(url, data=None):
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"User-Agent": "ForexScalperSignalBot/3.0"}
+        headers={"User-Agent": "ForexGoldSignalBot/1.0"}
     )
 
     try:
@@ -36,18 +39,18 @@ def get_json(url, data=None):
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         raise RuntimeError(
-            f"HTTP request failed with status {error.code}"
+            f"HTTP request failed: status {error.code}"
         ) from None
     except (urllib.error.URLError, TimeoutError):
-        raise RuntimeError(
-            "Network request failed or timed out"
-        ) from None
+        raise RuntimeError("Network request failed or timed out") from None
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected API response format")
 
     return result
 
 
 def calculate_ema(values, period):
-    """EMA seeded with the first period's simple moving average."""
     if len(values) < period:
         raise ValueError("Not enough prices for EMA")
 
@@ -67,8 +70,7 @@ def calculate_ema(values, period):
 
 
 def calculate_atr(candles, period):
-    """Calculate simple-average ATR using completed candles."""
-    true_ranges = []
+    ranges = []
 
     for i, candle in enumerate(candles):
         high = float(candle["high"])
@@ -84,26 +86,33 @@ def calculate_atr(candles, period):
                 abs(low - previous_close)
             )
 
-        true_ranges.append(true_range)
+        ranges.append(true_range)
 
-    if len(true_ranges) < period:
+    if len(ranges) < period:
         raise ValueError("Not enough candles for ATR")
 
-    return sum(true_ranges[-period:]) / period
+    return sum(ranges[-period:]) / period
 
 
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             state = json.load(file)
-            return state if isinstance(state, dict) else {}
+            if isinstance(state, dict):
+                return state
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        pass
+
+    return {}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
+    temporary_file = STATE_FILE + ".tmp"
+
+    with open(temporary_file, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
+
+    os.replace(temporary_file, STATE_FILE)
 
 
 def send_telegram(message):
@@ -127,33 +136,32 @@ def send_telegram(message):
         )
 
 
-def main():
+def check_market(symbol, market, state):
     query = urllib.parse.urlencode({
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "interval": INTERVAL,
         "outputsize": 100,
+        "timezone": "UTC",
         "apikey": API_KEY
     })
 
-    data = get_json(
-        "https://api.twelvedata.com/time_series?" + query
-    )
+    url = "https://api.twelvedata.com/time_series?" + query
+    data = get_json(url)
 
     if "values" not in data:
-        raise RuntimeError(
-            "Market data unavailable: "
-            + str(data.get("message", "No candles returned"))
-        )
+        reason = data.get("message", data.get("status", "No candles returned"))
+        raise RuntimeError("Market data unavailable: " + str(reason))
 
-    # Convert newest-first API data into oldest-first order.
+    # API normally returns newest candle first.
     candles = list(reversed(data["values"]))
 
-    # Exclude the latest candle because it may still be forming.
+    # Exclude the newest candle because it may still be forming.
     if candles:
         candles = candles[:-1]
 
-    if len(candles) < SLOW_PERIOD + ATR_PERIOD + 2:
-        raise RuntimeError("Not enough completed candles")
+    minimum = max(SLOW_PERIOD, ATR_PERIOD) + 2
+    if len(candles) < minimum:
+        raise RuntimeError("Not enough completed M1 candles")
 
     closes = [float(candle["close"]) for candle in candles]
     fast = calculate_ema(closes, FAST_PERIOD)
@@ -164,15 +172,15 @@ def main():
     previous = i - 1
     candle_time = candles[i]["datetime"]
 
-    state = load_state()
+    market_state = state.setdefault("markets", {}).setdefault(symbol, {})
 
-    if state.get("last_checked_candle") == candle_time:
-        print("This completed M1 candle was already checked.")
+    if market_state.get("last_checked_candle") == candle_time:
+        print(f"{symbol}: this completed candle was already checked.")
         return
 
     signal = None
 
-    # Detect a crossover between the two latest completed candles.
+    # Detect a fresh EMA crossover on the latest completed candle.
     if fast[previous] <= slow[previous] and fast[i] > slow[i]:
         signal = "BUY"
     elif fast[previous] >= slow[previous] and fast[i] < slow[i]:
@@ -190,49 +198,74 @@ def main():
             stop_loss = entry + sl_distance
             take_profit = entry - tp_distance
 
-        # EUR/USD pip convention: 1 pip = 0.0001.
-        atr_pips = atr / 0.0001
-        sl_pips = sl_distance / 0.0001
-        tp_pips = tp_distance / 0.0001
+        precision = market["precision"]
+
+        # Do not call Gold movements "pips"; report raw price movement.
+        if symbol == "EUR/USD":
+            movement_label = "EUR/USD movement"
+            unit = "pips"
+            unit_size = 0.0001
+        else:
+            movement_label = "Gold price movement"
+            unit = "USD"
+            unit_size = 1.0
+
+        atr_amount = atr / unit_size
+        sl_amount = sl_distance / unit_size
+        tp_amount = tp_distance / unit_size
 
         message = (
-            f"EUR/USD {signal} SCALPING SIGNAL\n"
-            f"Timeframe: M1 (1 minute)\n"
-            f"Completed candle: {candle_time}\n"
-            f"Estimated entry: {entry:.5f}\n"
-            f"Estimated stop-loss: {stop_loss:.5f}\n"
-            f"Estimated take-profit: {take_profit:.5f}\n"
-            f"ATR ({ATR_PERIOD}): {atr_pips:.1f} pips\n"
-            f"SL distance: {sl_pips:.1f} pips\n"
-            f"TP distance: {tp_pips:.1f} pips\n"
+            f"{market['label']} {signal} SIGNAL\n"
+            f"Timeframe: M1\n"
+            f"Completed candle (UTC): {candle_time}\n"
+            f"Estimated entry: {entry:.{precision}f}\n"
+            f"Estimated stop-loss: {stop_loss:.{precision}f}\n"
+            f"Estimated take-profit: {take_profit:.{precision}f}\n"
+            f"ATR ({ATR_PERIOD}): {atr_amount:.2f} {unit}\n"
+            f"SL distance: {sl_amount:.2f} {unit}\n"
+            f"TP distance: {tp_amount:.2f} {unit}\n"
             f"Risk/reward target: 1:1.5\n"
             f"Strategy: EMA 9/21 crossover + ATR\n"
             f"Mode: SIGNAL ONLY — no trade placed\n"
-            f"Prices are estimates; spread and slippage "
-            f"are not included.\n"
+            f"Prices are estimates. Spread, slippage, and broker "
+            f"price differences are not included.\n"
             f"Generated: {datetime.now(timezone.utc).isoformat()}"
         )
 
-        # Save only after Telegram accepts the message.
-        # If sending fails, the next run can retry this candle.
+        # Only mark the candle checked after Telegram accepts the alert.
         send_telegram(message)
 
-        state["last_checked_candle"] = candle_time
-        state["last_signal"] = signal
+        market_state["last_checked_candle"] = candle_time
+        market_state["last_signal"] = signal
         save_state(state)
 
-        print("Telegram scalping signal sent successfully.")
-        print(message)
-
+        print(f"{symbol}: Telegram signal sent successfully.")
     else:
-        state["last_checked_candle"] = candle_time
-        state["last_signal"] = None
+        market_state["last_checked_candle"] = candle_time
+        market_state["last_signal"] = None
         save_state(state)
 
-        print(
-            f"No new crossover for {SYMBOL} "
-            f"on M1 at {candle_time}"
+        print(f"{symbol}: No new crossover at {candle_time} UTC.")
+
+
+def main():
+    state = load_state()
+    failures = []
+
+    for symbol, market in MARKETS.items():
+        try:
+            check_market(symbol, market, state)
+        except Exception as error:
+            # A problem with one market should not stop the other.
+            print(f"{symbol}: ERROR: {error}")
+            failures.append(symbol)
+
+    if failures:
+        raise RuntimeError(
+            "Market check failed for: " + ", ".join(failures)
         )
+
+    print("All configured markets checked successfully.")
 
 
 if __name__ == "__main__":
