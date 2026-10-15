@@ -7,478 +7,279 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Only these four markets are enabled.
 MARKETS = {
-    "EUR/USD": {"digits": 5},
-    "GBP/USD": {"digits": 5},
-    "USD/JPY": {"digits": 3},
-    "AUD/USD": {"digits": 5},
+    "EUR/USD": 5,
+    "GBP/USD": 5,
+    "USD/JPY": 3,
+    "AUD/USD": 5,
 }
 
+STATE_FILE = "last_signal.json"
 FAST_EMA = 9
 SLOW_EMA = 21
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-
 SL_ATR = 1.5
 TP_ATR = 2.25
-
-STATE_FILE = "last_signal.json"
-
-# Space requests out to reduce rate-limit errors.
-REQUEST_INTERVAL = 9
-MAX_RETRIES = 2
-last_request_time = 0.0
+REQUEST_DELAY = 9
+last_request = 0.0
 
 
-# ============================================================
-# MARKET DATA
-# ============================================================
+def api_request(params):
+    global last_request
 
-def get_json(url, params):
-    global last_request_time
+    for attempt in range(3):
+        delay = REQUEST_DELAY - (time.monotonic() - last_request)
+        if delay > 0:
+            time.sleep(delay)
 
-    for attempt in range(MAX_RETRIES + 1):
-        elapsed = time.monotonic() - last_request_time
-        if elapsed < REQUEST_INTERVAL:
-            time.sleep(REQUEST_INTERVAL - elapsed)
-
-        request_url = url + "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(
-            request_url,
-            headers={"User-Agent": "ForexSignalBot/1.0"}
-        )
+        url = "https://api.twelvedata.com/time_series?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(url, headers={"User-Agent": "ForexSignalBot/2.0"})
 
         try:
-            last_request_time = time.monotonic()
+            last_request = time.monotonic()
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode())
 
-            with urllib.request.urlopen(req, timeout=30) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            # Twelve Data can report API errors in JSON.
-            if "status" in data and data["status"] == "error":
-                message = data.get("message", "Unknown API error")
-                code = data.get("code")
-
-                if code == 429 or "rate limit" in message.lower():
-                    if attempt < MAX_RETRIES:
-                        wait = 20 * (attempt + 1)
-                        print(f"Rate limit reached. Waiting {wait}s...")
-                        time.sleep(wait)
-                        continue
-
-                raise RuntimeError(
-                    f"Twelve Data error {code}: {message}"
-                )
+            if data.get("status") == "error":
+                raise RuntimeError(data.get("message", "Market data error"))
 
             if "values" not in data:
-                raise RuntimeError(
-                    f"Unexpected market-data response: {data}"
-                )
+                raise RuntimeError(f"Unexpected response: {data}")
 
-            return data
+            return data["values"]
 
         except urllib.error.HTTPError as error:
-            if error.code == 429 and attempt < MAX_RETRIES:
-                wait = 20 * (attempt + 1)
-                print(f"HTTP 429. Retrying in {wait}s...")
-                time.sleep(wait)
+            if error.code == 429 and attempt < 2:
+                time.sleep(20 * (attempt + 1))
                 continue
+            raise RuntimeError(f"Market API HTTP {error.code}") from error
 
-            raise RuntimeError(
-                f"Market data HTTP error: {error.code}"
-            ) from error
-
-        except urllib.error.URLError as error:
-            if attempt < MAX_RETRIES:
-                time.sleep(5)
-                continue
-
-            raise RuntimeError(
-                f"Market data connection error: {error}"
-            ) from error
-
-    raise RuntimeError("Market-data retries exhausted.")
+    raise RuntimeError("Market API retries exhausted")
 
 
-def get_candles(symbol, interval):
-    data = get_json(
-        "https://api.twelvedata.com/time_series",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": 100,
-            "apikey": API_KEY,
-            "order": "ASC",
-        },
-    )
+def candles(symbol, interval):
+    values = api_request({
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": 100,
+        "apikey": API_KEY,
+        "order": "ASC",
+    })
 
-    candles = []
+    result = [{
+        "time": item["datetime"],
+        "open": float(item["open"]),
+        "high": float(item["high"]),
+        "low": float(item["low"]),
+        "close": float(item["close"]),
+    } for item in values]
 
-    for item in data["values"]:
-        candles.append({
-            "time": item["datetime"],
-            "open": float(item["open"]),
-            "high": float(item["high"]),
-            "low": float(item["low"]),
-            "close": float(item["close"]),
-        })
+    result.sort(key=lambda item: item["time"])
 
-    # Ensure oldest-to-newest order.
-    candles.sort(key=lambda candle: candle["time"])
+    # Ignore the newest candle because it may still be forming.
+    if len(result) > 1:
+        result = result[:-1]
 
-    # Exclude the newest candle because it may still be forming.
-    if len(candles) > 1:
-        candles = candles[:-1]
+    if len(result) < 50:
+        raise RuntimeError(f"Insufficient {interval} candles for {symbol}")
 
-    if len(candles) < 50:
-        raise RuntimeError(
-            f"Not enough completed {interval} candles for {symbol}."
-        )
+    return result
 
-    return candles
-
-
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
 
 def ema(values, period):
-    if len(values) < period:
-        raise ValueError("Not enough data to calculate EMA.")
-
-    result = [None] * (period - 1)
+    output = [None] * (period - 1)
     current = sum(values[:period]) / period
-    result.append(current)
-
+    output.append(current)
     multiplier = 2 / (period + 1)
 
     for value in values[period:]:
-        current = (
-            value * multiplier
-            + current * (1 - multiplier)
-        )
-        result.append(current)
+        current = value * multiplier + current * (1 - multiplier)
+        output.append(current)
 
-    return result
+    return output
 
 
 def rsi(values, period=14):
-    if len(values) <= period:
-        raise ValueError("Not enough data to calculate RSI.")
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
+    gain = sum(gains[:period]) / period
+    loss = sum(losses[:period]) / period
+    output = [None] * period
 
-    gains = [max(change, 0) for change in changes]
-    losses = [max(-change, 0) for change in changes]
+    def value(g, l):
+        if l == 0:
+            return 100.0 if g > 0 else 50.0
+        return 100 - 100 / (1 + g / l)
 
-    average_gain = sum(gains[:period]) / period
-    average_loss = sum(losses[:period]) / period
-
-    result = [None] * period
-
-    def calculate_rsi(gain, loss):
-        if loss == 0:
-            return 100.0 if gain > 0 else 50.0
-        relative_strength = gain / loss
-        return 100 - (100 / (1 + relative_strength))
-
-    result.append(calculate_rsi(average_gain, average_loss))
+    output.append(value(gain, loss))
 
     for i in range(period, len(gains)):
-        average_gain = (
-            average_gain * (period - 1) + gains[i]
-        ) / period
+        gain = (gain * (period - 1) + gains[i]) / period
+        loss = (loss * (period - 1) + losses[i]) / period
+        output.append(value(gain, loss))
 
-        average_loss = (
-            average_loss * (period - 1) + losses[i]
-        ) / period
-
-        result.append(
-            calculate_rsi(average_gain, average_loss)
-        )
-
-    return result
+    return output
 
 
-def atr(candles, period=14):
-    if len(candles) <= period:
-        raise ValueError("Not enough data to calculate ATR.")
+def atr(data, period=14):
+    ranges = []
 
-    true_ranges = []
-
-    for i, candle in enumerate(candles):
+    for i, item in enumerate(data):
         if i == 0:
-            true_range = candle["high"] - candle["low"]
+            tr = item["high"] - item["low"]
         else:
-            previous_close = candles[i - 1]["close"]
-
-            true_range = max(
-                candle["high"] - candle["low"],
-                abs(candle["high"] - previous_close),
-                abs(candle["low"] - previous_close),
+            previous = data[i - 1]["close"]
+            tr = max(
+                item["high"] - item["low"],
+                abs(item["high"] - previous),
+                abs(item["low"] - previous),
             )
+        ranges.append(tr)
 
-        true_ranges.append(true_range)
+    output = [None] * (period - 1)
+    current = sum(ranges[:period]) / period
+    output.append(current)
 
-    result = [None] * (period - 1)
-    current = sum(true_ranges[:period]) / period
-    result.append(current)
+    for tr in ranges[period:]:
+        current = (current * (period - 1) + tr) / period
+        output.append(current)
 
-    for value in true_ranges[period:]:
-        current = (
-            current * (period - 1) + value
-        ) / period
-        result.append(current)
-
-    return result
+    return output
 
 
-# ============================================================
-# STATE AND TELEGRAM
-# ============================================================
-
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            state = json.load(file)
-
-        return state if isinstance(state, dict) else {}
-
-    except (OSError, json.JSONDecodeError):
-        print("Could not read saved signal state; starting fresh.")
-        return {}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2)
-
-
-def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
-
+def telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
-    }).encode("utf-8")
+    }).encode()
 
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-    )
+    request = urllib.request.Request(url, data=payload, method="POST")
 
     with urllib.request.urlopen(request, timeout=30) as response:
-        result = json.loads(response.read().decode("utf-8"))
+        result = json.loads(response.read().decode())
 
     if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram rejected the message: {result}"
-        )
+        raise RuntimeError("Telegram rejected the message")
 
 
-# ============================================================
-# SIGNAL ANALYSIS
-# ============================================================
+def analyse(symbol):
+    m15 = candles(symbol, "15min")
+    m30 = candles(symbol, "30min")
 
-def analyze(symbol):
-    h1 = get_candles(symbol, "1h")
-    h4 = get_candles(symbol, "4h")
+    close15 = [x["close"] for x in m15]
+    close30 = [x["close"] for x in m30]
 
-    h1_closes = [candle["close"] for candle in h1]
-    h4_closes = [candle["close"] for candle in h4]
+    fast15 = ema(close15, 9)
+    slow15 = ema(close15, 21)
+    fast30 = ema(close30, 9)
+    slow30 = ema(close30, 21)
+    rsi15 = rsi(close15)
+    atr15 = atr(m15)
 
-    h1_fast = ema(h1_closes, FAST_EMA)
-    h1_slow = ema(h1_closes, SLOW_EMA)
+    i = len(m15) - 1
+    j = len(m30) - 1
+    current = m15[i]
+    previous = m15[i - 1]
 
-    h4_fast = ema(h4_closes, FAST_EMA)
-    h4_slow = ema(h4_closes, SLOW_EMA)
-
-    rsi_values = rsi(h1_closes, RSI_PERIOD)
-    atr_values = atr(h1, ATR_PERIOD)
-
-    current = h1[-1]
-    previous = h1[-2]
-
-    i = len(h1) - 1
-    j = len(h4) - 1
-
-    current_rsi = rsi_values[i]
-    current_atr = atr_values[i]
-
-    if current_rsi is None or current_atr is None:
-        return None
-
-    # H4 trend confirmation.
-    bullish_h4 = h4_fast[j] > h4_slow[j]
-    bearish_h4 = h4_fast[j] < h4_slow[j]
-
-    # H1 trend alignment.
-    bullish_h1 = h1_fast[i] > h1_slow[i]
-    bearish_h1 = h1_fast[i] < h1_slow[i]
-
-    # Pullback recovery through EMA 9.
-    bullish_recovery = (
-        previous["close"] <= h1_fast[i - 1]
-        and current["close"] > h1_fast[i]
+    buy = (
+        fast30[j] > slow30[j]
+        and fast15[i] > slow15[i]
+        and previous["close"] <= fast15[i - 1]
+        and current["close"] > fast15[i]
         and current["close"] > current["open"]
+        and 50 <= rsi15[i] <= 68
     )
 
-    bearish_recovery = (
-        previous["close"] >= h1_fast[i - 1]
-        and current["close"] < h1_fast[i]
+    sell = (
+        fast30[j] < slow30[j]
+        and fast15[i] < slow15[i]
+        and previous["close"] >= fast15[i - 1]
+        and current["close"] < fast15[i]
         and current["close"] < current["open"]
+        and 32 <= rsi15[i] <= 50
     )
 
-    direction = None
-
-    if (
-        bullish_h4
-        and bullish_h1
-        and bullish_recovery
-        and 50 <= current_rsi <= 68
-    ):
-        direction = "BUY"
-
-    elif (
-        bearish_h4
-        and bearish_h1
-        and bearish_recovery
-        and 32 <= current_rsi <= 50
-    ):
-        direction = "SELL"
-
-    if direction is None:
-        print(
-            f"{symbol}: No qualified setup on H1 candle "
-            f"{current['time']}."
-        )
+    if not buy and not sell:
+        print(f"{symbol}: No setup on M15 candle {current['time']}")
         return None
 
+    direction = "BUY" if buy else "SELL"
     entry = current["close"]
+    volatility = atr15[i]
 
     if direction == "BUY":
-        stop_loss = entry - SL_ATR * current_atr
-        take_profit = entry + TP_ATR * current_atr
+        stop = entry - SL_ATR * volatility
+        target = entry + TP_ATR * volatility
     else:
-        stop_loss = entry + SL_ATR * current_atr
-        take_profit = entry - TP_ATR * current_atr
+        stop = entry + SL_ATR * volatility
+        target = entry - TP_ATR * volatility
 
-    digits = MARKETS[symbol]["digits"]
+    digits = MARKETS[symbol]
 
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "candle_time": current["time"],
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rsi": current_rsi,
-        "atr": current_atr,
-        "digits": digits,
-    }
-
-
-def format_signal(signal):
-    digits = signal["digits"]
-
-    return (
-        "FOREX SWING SIGNAL\n\n"
-        f"Pair: {signal['symbol']}\n"
-        f"Direction: {signal['direction']}\n"
-        "Entry timeframe: H1\n"
-        "Trend confirmation: H4\n\n"
-        f"Entry: {signal['entry']:.{digits}f}\n"
-        f"Stop Loss: {signal['stop_loss']:.{digits}f}\n"
-        f"Take Profit: {signal['take_profit']:.{digits}f}\n\n"
-        f"RSI (14): {signal['rsi']:.2f}\n"
-        f"ATR (14): {signal['atr']:.{digits}f}\n"
-        "Strategy: EMA 9/21 trend, pullback recovery, "
-        "candle confirmation and RSI filter.\n\n"
-        f"Completed H1 candle: {signal['candle_time']}\n"
-        "Signal only — no automatic trade execution. "
-        "Verify the market price before entering."
+    message = (
+        "FOREX SIGNAL — M15 / M30\n\n"
+        f"Pair: {symbol}\nDirection: {direction}\n"
+        f"Entry: {entry:.{digits}f}\n"
+        f"Stop Loss: {stop:.{digits}f}\n"
+        f"Take Profit: {target:.{digits}f}\n"
+        f"RSI: {rsi15[i]:.2f}\n"
+        f"Completed M15 candle: {current['time']}\n\n"
+        "Signal only. Verify the live price before trading."
     )
 
+    return current["time"], direction, message
 
-# ============================================================
-# MAIN CHECK
-# ============================================================
 
 def main():
-    state = load_state()
-    successful_checks = 0
-    failed_markets = []
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        state = {}
 
-    print(
-        "Starting Forex Signal Bot at "
-        + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    )
-    print("Enabled markets: " + ", ".join(MARKETS.keys()))
+    failures = []
+
+    print("Forex signal bot: M15 entries, M30 trend confirmation")
+    print("Markets: " + ", ".join(MARKETS))
 
     for symbol in MARKETS:
         try:
-            signal = analyze(symbol)
-            successful_checks += 1
+            signal = analyse(symbol)
 
             if signal is None:
                 continue
 
-            signature = (
-                f"{signal['direction']}|{signal['candle_time']}"
-            )
+            candle_time, direction, message = signal
+            signature = f"{direction}|{candle_time}"
 
             if state.get(symbol) == signature:
-                print(f"{symbol}: This signal was already sent.")
+                print(f"{symbol}: Already alerted for this candle")
                 continue
 
-            message = format_signal(signal)
-            send_telegram(message)
-
+            telegram(message)
             state[symbol] = signature
-            save_state(state)
 
-            print(f"{symbol}: Telegram signal sent.")
+            with open(STATE_FILE, "w", encoding="utf-8") as file:
+                json.dump(state, file, indent=2)
+
+            print(f"{symbol}: Telegram alert sent")
 
         except Exception as error:
-            failed_markets.append(symbol)
+            failures.append(symbol)
             print(f"{symbol}: ERROR: {error}")
-            continue
 
-    # Always save the state file, including on a no-signal run.
-    save_state(state)
+    with open(STATE_FILE, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
 
-    if failed_markets:
-        print(
-            "Some markets were unavailable: "
-            + ", ".join(failed_markets)
-        )
-
-    if successful_checks == 0:
-        print("No markets could be analysed during this run.")
-    else:
-        print(
-            f"Finished. Successfully analysed {successful_checks} "
-            f"of {len(MARKETS)} markets."
-        )
+    print(f"Finished at {datetime.now(timezone.utc).isoformat()}")
+    if failures:
+        print("Unavailable markets: " + ", ".join(failures))
 
 
 if __name__ == "__main__":
