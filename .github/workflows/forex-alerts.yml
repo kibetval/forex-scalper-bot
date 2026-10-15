@@ -4,7 +4,7 @@ name: Forex Telegram Signal Alerts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7 * * * *"
 
 permissions:
   contents: write
@@ -12,7 +12,7 @@ permissions:
 jobs:
   check-forex-signals:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
 
     steps:
       - name: Get repository files
@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check market and send alerts
+      - name: Check markets and send Telegram alerts
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -39,3 +39,4 @@ jobs:
             git commit -m "Update signal checker state"
             git push
           fi
+          
