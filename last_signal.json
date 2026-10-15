@@ -3,11 +3,11 @@
   "last_signal": null,
   "markets": {
     "EUR/USD": {
-      "last_checked_candle": "2026-10-15 01:02:00",
-      "last_signal": "BUY"
+      "last_checked_candle": "2026-10-15 05:48:00",
+      "last_signal": null
     },
     "XAU/USD": {
-      "last_checked_candle": "2026-10-15 01:02:00",
+      "last_checked_candle": "2026-10-15 05:48:00",
       "last_signal": null
     }
   }
